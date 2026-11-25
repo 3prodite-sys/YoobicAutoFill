@@ -2,6 +2,8 @@ package com.restoran.yoobicautofill
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.graphics.Color
 import android.graphics.Path
@@ -24,6 +26,15 @@ class YoobicAccessibilityService : AccessibilityService() {
     private var windowManager: WindowManager? = null
     private var floatingView: View? = null
     private val handler = Handler(Looper.getMainLooper())
+
+    private data class FillTask(
+        val key: String,
+        val isClickOnly: Boolean,
+        val value: String,
+        val targetNode: AccessibilityNodeInfo?,
+        val tapX: Float,
+        val tapY: Float
+    )
 
     private val allBreakfastItems = listOf(
         BreakfastItem("croissant", "Savoury croissant", "Ham", "86.5", true),
@@ -109,18 +120,57 @@ class YoobicAccessibilityService : AccessibilityService() {
         windowManager?.addView(btn, params)
     }
 
+    private fun getYoobicRoot(): AccessibilityNodeInfo? {
+        val active = rootInActiveWindow
+        if (active != null && active.packageName?.toString() != packageName) {
+            return active
+        }
+        for (win in windows) {
+            val r = win.root ?: continue
+            if (r.packageName?.toString() != packageName && r.childCount > 0) {
+                return r
+            }
+        }
+        return active
+    }
+
+    private fun getNodeText(node: AccessibilityNodeInfo): String {
+        val t = node.text?.toString()?.trim().orEmpty()
+        if (t.isNotEmpty()) return t
+        return node.contentDescription?.toString()?.trim().orEmpty()
+    }
+
+    private fun normalizeLabel(raw: String): String {
+        return raw.replace("\\s+".toRegex(), " ").trim()
+    }
+
+    private fun collectAllNodes(node: AccessibilityNodeInfo?, out: MutableList<AccessibilityNodeInfo>) {
+        if (node == null) return
+        out.add(node)
+        for (i in 0 until node.childCount) {
+            collectAllNodes(node.getChild(i), out)
+        }
+    }
+
     private fun dispatchAutoFill() {
-        val root = rootInActiveWindow ?: return
-        if (isTemperatureCheckScreen(root)) {
+        val root = getYoobicRoot() ?: return
+        val nodes = mutableListOf<AccessibilityNodeInfo>()
+        collectAllNodes(root, nodes)
+
+        val isTempCheck = nodes.any {
+            val txt = normalizeLabel(getNodeText(it))
+            txt.contains("Temperature ch", ignoreCase = true) ||
+                txt.contains("FRIDGES", ignoreCase = true) ||
+                txt.contains("FREEZERS", ignoreCase = true) ||
+                txt.contains("LANGARS", ignoreCase = true) ||
+                txt.contains("PRODUCTS ON DISPLAY", ignoreCase = true)
+        }
+
+        if (isTempCheck) {
             runTemperatureCheckAutoFill()
         } else {
             runBreakfastAutoFill()
         }
-    }
-
-    private fun isTemperatureCheckScreen(root: AccessibilityNodeInfo): Boolean {
-        val markers = listOf("Temperature ch", "FRIDGES", "FREEZERS", "LANGARS", "PRODUCTS ON DISPLAY")
-        return markers.any { !root.findAccessibilityNodeInfosByText(it).isNullOrEmpty() }
     }
 
     // --- TEMPERATURE CHECK OTOMASYONU ---
@@ -138,86 +188,191 @@ class YoobicAccessibilityService : AccessibilityService() {
         Toast.makeText(this, "Temperature Check dolduruluyor...", Toast.LENGTH_SHORT).show()
         val completedKeys = mutableSetOf<String>()
 
-        fun executePass(passIndex: Int) {
-            scanAndFillTemperaturePass(savedValues, completedKeys)
-            if (passIndex < 4) {
-                scrollDown()
-                handler.postDelayed({ executePass(passIndex + 1) }, 650)
-            } else {
-                Toast.makeText(this, "Temperature Check tamamlandı!", Toast.LENGTH_SHORT).show()
+        fun executeScrollPass(passIndex: Int) {
+            val tasks = collectTemperatureTasks(savedValues, completedKeys)
+            runTaskQueue(tasks, 0) {
+                if (completedKeys.size < 18 && passIndex < 6) {
+                    scrollDown(0.75f, 0.32f)
+                    handler.postDelayed({ executeScrollPass(passIndex + 1) }, 750)
+                } else {
+                    Toast.makeText(this, "Tamamlandı! (${completedKeys.size}/18 alan)", Toast.LENGTH_SHORT).show()
+                }
             }
         }
 
-        executePass(0)
+        executeScrollPass(0)
     }
 
-    private fun scanAndFillTemperaturePass(
+    private fun collectTemperatureTasks(
         values: Map<String, String>,
         completed: MutableSet<String>
-    ) {
-        val root = rootInActiveWindow ?: return
-        val editTexts = mutableListOf<AccessibilityNodeInfo>()
-        collectEditTexts(root, editTexts)
+    ): List<FillTask> {
+        val root = getYoobicRoot() ?: return emptyList()
+        val allNodes = mutableListOf<AccessibilityNodeInfo>()
+        collectAllNodes(root, allNodes)
 
-        // 1. "Yes" butonlarını işaretle
-        val yesNodes = root.findAccessibilityNodeInfosByText("Yes").orEmpty()
-            .filter { it.text?.toString()?.trim() == "Yes" }
+        val dm = resources.displayMetrics
+        val minY = (dm.heightPixels * 0.11f).toInt()
+        val maxY = (dm.heightPixels * 0.88f).toInt()
+        val tasks = mutableListOf<FillTask>()
 
-        for (yesNode in yesNodes) {
-            val yesRect = Rect()
-            yesNode.getBoundsInScreen(yesRect)
+        // 1. "Yes" butonlarını bul
+        for (node in allNodes) {
+            if (!getNodeText(node).equals("Yes", ignoreCase = true)) continue
+            val r = Rect()
+            node.getBoundsInScreen(r)
+            if (r.width() <= 0 || r.height() <= 0 || r.top < minY || r.bottom > maxY) continue
 
-            if (!completed.contains("yes_working") && isTextDirectlyAbove(root, "working?", yesRect.top, 380)) {
-                clickNodeOrParent(yesNode)
+            if (!completed.contains("yes_working") && hasTextAbove(allNodes, "working", r.top, 450)) {
+                tasks.add(FillTask("yes_working", true, "", node, r.centerX().toFloat(), r.centerY().toFloat()))
                 completed.add("yes_working")
-            } else if (!completed.contains("yes_display") && isTextDirectlyAbove(root, "RIGHT TICKET", yesRect.top, 450)) {
-                clickNodeOrParent(yesNode)
+            } else if (!completed.contains("yes_display") && hasTextAbove(allNodes, "RIGHT TICKET", r.top, 550)) {
+                tasks.add(FillTask("yes_display", true, "", node, r.centerX().toFloat(), r.centerY().toFloat()))
                 completed.add("yes_display")
             }
         }
 
-        // 2. Sıcaklık kutularını doldur
+        // 2. Sıcaklık giriş kutularını bul
         for (field in tempCheckNumericFields) {
             if (completed.contains(field.key)) continue
-            val labelNodes = root.findAccessibilityNodeInfosByText(field.label).orEmpty()
-                .filter { it.text?.toString()?.trim() == field.label }
-            if (labelNodes.isEmpty()) continue
+            val labelNode = allNodes.firstOrNull {
+                normalizeLabel(getNodeText(it)).equals(field.label, ignoreCase = true)
+            } ?: continue
 
-            val labelRect = Rect()
-            labelNodes[0].getBoundsInScreen(labelRect)
-            val targetEdit = findEditTextBelowLabel(editTexts, labelRect)
-            if (targetEdit != null) {
-                setTextValue(targetEdit, values[field.key] ?: field.defaultValue)
-                completed.add(field.key)
+            val lr = Rect()
+            labelNode.getBoundsInScreen(lr)
+            if (lr.width() <= 0 || lr.top < minY) continue
+
+            val inputNode = findInputNodeBelow(allNodes, lr)
+            val ir = Rect()
+            if (inputNode != null) {
+                inputNode.getBoundsInScreen(ir)
+            } else {
+                ir.set(lr.left, lr.bottom + 18, lr.left + 260, lr.bottom + 115)
             }
+
+            if (ir.bottom > maxY) continue
+
+            tasks.add(
+                FillTask(
+                    key = field.key,
+                    isClickOnly = false,
+                    value = values[field.key] ?: field.defaultValue,
+                    targetNode = inputNode,
+                    tapX = ir.centerX().toFloat(),
+                    tapY = ir.centerY().toFloat()
+                )
+            )
+            completed.add(field.key)
         }
 
-        // 3. Dört farklı "Initials" kutusunu bölüm konumuna göre doldur
-        val initialsNodes = root.findAccessibilityNodeInfosByText("Initials").orEmpty()
-            .filter { it.text?.toString()?.trim() == "Initials" }
+        // 3. Dört farklı "Initials" kutusunu bölüm konumuna göre bul
+        for (node in allNodes) {
+            if (!normalizeLabel(getNodeText(node)).equals("Initials", ignoreCase = true)) continue
+            val lr = Rect()
+            node.getBoundsInScreen(lr)
+            if (lr.width() <= 0 || lr.top < minY) continue
 
-        for (initNode in initialsNodes) {
-            val labelRect = Rect()
-            initNode.getBoundsInScreen(labelRect)
-            val targetEdit = findEditTextBelowLabel(editTexts, labelRect) ?: continue
+            val initKey = resolveInitialsKey(allNodes, lr) ?: continue
+            if (completed.contains(initKey)) continue
 
-            val initKey = resolveInitialsKey(root, labelRect)
-            if (initKey != null && !completed.contains(initKey)) {
-                setTextValue(targetEdit, values[initKey] ?: "")
-                completed.add(initKey)
+            val inputNode = findInputNodeBelow(allNodes, lr)
+            val ir = Rect()
+            if (inputNode != null) {
+                inputNode.getBoundsInScreen(ir)
+            } else {
+                ir.set(lr.left, lr.bottom + 18, lr.left + 400, lr.bottom + 115)
             }
+
+            if (ir.bottom > maxY) continue
+
+            tasks.add(
+                FillTask(
+                    key = initKey,
+                    isClickOnly = false,
+                    value = values[initKey] ?: "",
+                    targetNode = inputNode,
+                    tapX = ir.centerX().toFloat(),
+                    tapY = ir.centerY().toFloat()
+                )
+            )
+            completed.add(initKey)
+        }
+
+        return tasks
+    }
+
+    private fun runTaskQueue(tasks: List<FillTask>, index: Int, onFinished: () -> Unit) {
+        if (index >= tasks.size) {
+            onFinished()
+            return
+        }
+
+        val task = tasks[index]
+        if (task.isClickOnly) {
+            task.targetNode?.let { clickNodeOrParent(it) }
+            tapScreen(task.tapX, task.tapY)
+            handler.postDelayed({ runTaskQueue(tasks, index + 1, onFinished) }, 220)
+        } else {
+            task.targetNode?.let {
+                it.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+                clickNodeOrParent(it)
+            }
+            tapScreen(task.tapX, task.tapY)
+
+            handler.postDelayed({
+                val focused = getYoobicRoot()?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: task.targetNode
+                if (focused != null) {
+                    applyTextOrPaste(focused, task.value)
+                }
+                handler.postDelayed({ runTaskQueue(tasks, index + 1, onFinished) }, 200)
+            }, 220)
         }
     }
 
-    private fun resolveInitialsKey(root: AccessibilityNodeInfo, labelRect: Rect): String? {
-        val hasFreezersBelow = isTextBelow(root, "FREEZERS", labelRect.bottom)
-        val hasLangarsBelow = isTextBelow(root, "LANGARS", labelRect.bottom)
-        val hasDisplayBelow = isTextBelow(root, "PRODUCTS ON DISPLAY", labelRect.bottom)
+    private fun applyTextOrPaste(node: AccessibilityNodeInfo, value: String) {
+        node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+        val args = Bundle().apply {
+            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, value)
+        }
+        val setOk = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
 
-        val hasFridgeAbove = isTextAbove(root, "Fridge #", labelRect.top)
-        val hasFreezerAbove = isTextAbove(root, "Freezer #", labelRect.top)
-        val hasLangarAbove = isTextAbove(root, "- Langar", labelRect.top)
-        val hasTicketAbove = isTextAbove(root, "RIGHT TICKET", labelRect.top)
+        if (!setOk || node.text?.toString() != value) {
+            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            clipboard.setPrimaryClip(ClipData.newPlainText("yoobic_val", value))
+            node.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+        }
+    }
+
+    private fun findInputNodeBelow(
+        allNodes: List<AccessibilityNodeInfo>,
+        labelRect: Rect
+    ): AccessibilityNodeInfo? {
+        return allNodes.firstOrNull { node ->
+            val cls = node.className?.toString().orEmpty()
+            val isInputLike = cls.contains("EditText") || node.isEditable ||
+                (node.isFocusable && node.isClickable && getNodeText(node).isEmpty())
+            if (!isInputLike) return@firstOrNull false
+
+            val r = Rect()
+            node.getBoundsInScreen(r)
+            r.width() > 60 &&
+                r.height() in 25..220 &&
+                r.top >= labelRect.bottom - 10 &&
+                (r.top - labelRect.bottom) < 220 &&
+                kotlin.math.abs(r.left - labelRect.left) < 140
+        }
+    }
+
+    private fun resolveInitialsKey(allNodes: List<AccessibilityNodeInfo>, labelRect: Rect): String? {
+        val hasFreezersBelow = hasTextBelow(allNodes, "FREEZERS", labelRect.bottom)
+        val hasLangarsBelow = hasTextBelow(allNodes, "LANGARS", labelRect.bottom)
+        val hasDisplayBelow = hasTextBelow(allNodes, "PRODUCTS ON DISPLAY", labelRect.bottom)
+
+        val hasFridgeAbove = hasTextAbove(allNodes, "Fridge #", labelRect.top, 1200)
+        val hasFreezerAbove = hasTextAbove(allNodes, "Freezer #", labelRect.top, 1200)
+        val hasLangarAbove = hasTextAbove(allNodes, "- Langar", labelRect.top, 1200)
+        val hasTicketAbove = hasTextAbove(allNodes, "RIGHT TICKET", labelRect.top, 1200)
 
         return when {
             hasFreezersBelow || (hasFridgeAbove && !hasFreezerAbove) -> "tc_init_fridges"
@@ -228,51 +383,44 @@ class YoobicAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun findEditTextBelowLabel(
-        editTexts: List<AccessibilityNodeInfo>,
-        labelRect: Rect
-    ): AccessibilityNodeInfo? {
-        return editTexts.firstOrNull { et ->
-            val r = Rect()
-            et.getBoundsInScreen(r)
-            r.top >= labelRect.bottom - 15 &&
-                (r.top - labelRect.bottom) < 250 &&
-                kotlin.math.abs(r.left - labelRect.left) < 140
-        }
-    }
-
-    private fun isTextDirectlyAbove(
-        root: AccessibilityNodeInfo,
+    private fun hasTextAbove(
+        allNodes: List<AccessibilityNodeInfo>,
         query: String,
         targetTop: Int,
         maxDist: Int
     ): Boolean {
-        return root.findAccessibilityNodeInfosByText(query).orEmpty().any {
+        return allNodes.any {
+            if (!normalizeLabel(getNodeText(it)).contains(query, ignoreCase = true)) return@any false
             val r = Rect()
             it.getBoundsInScreen(r)
-            r.bottom <= targetTop + 15 && (targetTop - r.bottom) < maxDist
+            r.top < targetTop && (targetTop - r.bottom) < maxDist
         }
     }
 
-    private fun isTextAbove(root: AccessibilityNodeInfo, query: String, targetTop: Int): Boolean {
-        return root.findAccessibilityNodeInfosByText(query).orEmpty().any {
-            val r = Rect()
-            it.getBoundsInScreen(r)
-            r.top < targetTop
-        }
-    }
-
-    private fun isTextBelow(root: AccessibilityNodeInfo, query: String, targetBottom: Int): Boolean {
-        return root.findAccessibilityNodeInfosByText(query).orEmpty().any {
+    private fun hasTextBelow(
+        allNodes: List<AccessibilityNodeInfo>,
+        query: String,
+        targetBottom: Int
+    ): Boolean {
+        return allNodes.any {
+            if (!normalizeLabel(getNodeText(it)).contains(query, ignoreCase = true)) return@any false
             val r = Rect()
             it.getBoundsInScreen(r)
             r.bottom > targetBottom
         }
     }
 
+    private fun tapScreen(x: Float, y: Float) {
+        val path = Path().apply { moveTo(x, y) }
+        val gesture = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0, 50))
+            .build()
+        dispatchGesture(gesture, null, null)
+    }
+
     private fun clickNodeOrParent(node: AccessibilityNodeInfo) {
         var current: AccessibilityNodeInfo? = node
-        repeat(3) {
+        repeat(4) {
             if (current != null) {
                 if (current!!.isClickable) {
                     current!!.performAction(AccessibilityNodeInfo.ACTION_CLICK)
@@ -300,7 +448,7 @@ class YoobicAccessibilityService : AccessibilityService() {
 
         handler.postDelayed({
             fillEmptyFieldsForItems(firstBatch)
-            scrollDown()
+            scrollDown(0.78f, 0.25f)
             handler.postDelayed({
                 val secondBatch = processVisibleBreakfastItems(activeItems.filterNot { firstBatch.contains(it) })
                 handler.postDelayed({
@@ -312,13 +460,17 @@ class YoobicAccessibilityService : AccessibilityService() {
     }
 
     private fun processVisibleBreakfastItems(candidates: List<BreakfastItem>): List<BreakfastItem> {
-        val root = rootInActiveWindow ?: return emptyList()
+        val root = getYoobicRoot() ?: return emptyList()
+        val allNodes = mutableListOf<AccessibilityNodeInfo>()
+        collectAllNodes(root, allNodes)
         val triggered = mutableListOf<BreakfastItem>()
 
         for (item in candidates) {
-            val matches = root.findAccessibilityNodeInfosByText(item.label)
-            if (!matches.isNullOrEmpty()) {
-                val sw = findSwitchNear(matches[0])
+            val match = allNodes.firstOrNull {
+                normalizeLabel(getNodeText(it)).contains(item.label, ignoreCase = true)
+            }
+            if (match != null) {
+                val sw = findSwitchNear(match)
                 if (sw != null) {
                     if (!sw.isChecked) {
                         sw.performAction(AccessibilityNodeInfo.ACTION_CLICK)
@@ -332,36 +484,28 @@ class YoobicAccessibilityService : AccessibilityService() {
 
     private fun fillEmptyFieldsForItems(items: List<BreakfastItem>) {
         if (items.isEmpty()) return
-        val root = rootInActiveWindow ?: return
-        val editTexts = mutableListOf<AccessibilityNodeInfo>()
-        collectEditTexts(root, editTexts)
+        val root = getYoobicRoot() ?: return
+        val allNodes = mutableListOf<AccessibilityNodeInfo>()
+        collectAllNodes(root, allNodes)
 
-        val emptyInputs = editTexts.filter {
-            val txt = it.text?.toString().orEmpty()
-            val hint = it.hintText?.toString().orEmpty()
-            txt.isEmpty() || txt == hint
+        val emptyInputs = allNodes.filter {
+            val cls = it.className?.toString().orEmpty()
+            (cls.contains("EditText") || it.isEditable) &&
+                (it.text?.toString().orEmpty().isEmpty() || it.text?.toString() == it.hintText?.toString())
         }
 
         var idx = 0
         for (item in items) {
             if (idx + 1 >= emptyInputs.size) break
-            setTextValue(emptyInputs[idx], item.defaultProduct)
-            setTextValue(emptyInputs[idx + 1], item.defaultTemp)
+            applyTextOrPaste(emptyInputs[idx], item.defaultProduct)
+            applyTextOrPaste(emptyInputs[idx + 1], item.defaultTemp)
             idx += 2
         }
     }
 
-    private fun setTextValue(node: AccessibilityNodeInfo, value: String) {
-        node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-        val args = Bundle().apply {
-            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, value)
-        }
-        node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
-    }
-
     private fun findSwitchNear(node: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
         var parent = node?.parent
-        repeat(3) {
+        repeat(4) {
             if (parent != null) {
                 val found = findCheckableChild(parent)
                 if (found != null) return found
@@ -383,21 +527,11 @@ class YoobicAccessibilityService : AccessibilityService() {
         return null
     }
 
-    private fun collectEditTexts(node: AccessibilityNodeInfo?, out: MutableList<AccessibilityNodeInfo>) {
-        if (node == null) return
-        if (node.className?.toString() == "android.widget.EditText" && node.isEditable) {
-            out.add(node)
-        }
-        for (i in 0 until node.childCount) {
-            collectEditTexts(node.getChild(i), out)
-        }
-    }
-
-    private fun scrollDown() {
+    private fun scrollDown(startRatio: Float, endRatio: Float) {
         val dm = resources.displayMetrics
         val path = Path().apply {
-            moveTo(dm.widthPixels / 2f, dm.heightPixels * 0.78f)
-            lineTo(dm.widthPixels / 2f, dm.heightPixels * 0.25f)
+            moveTo(dm.widthPixels / 2f, dm.heightPixels * startRatio)
+            lineTo(dm.widthPixels / 2f, dm.heightPixels * endRatio)
         }
         val gesture = GestureDescription.Builder()
             .addStroke(GestureDescription.StrokeDescription(path, 0, 350))
