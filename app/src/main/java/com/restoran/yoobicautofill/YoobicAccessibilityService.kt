@@ -1,3 +1,98 @@
+package com.restoran.yoobicautofill
+
+import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.GestureDescription
+import android.content.Context
+import android.graphics.Color
+import android.graphics.Path
+import android.graphics.PixelFormat
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.view.Gravity
+import android.view.MotionEvent
+import android.view.View
+import android.view.WindowManager
+import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
+import android.widget.Button
+import android.widget.Toast
+
+class YoobicAccessibilityService : AccessibilityService() {
+
+    private var windowManager: WindowManager? = null
+    private var floatingView: View? = null
+    private val handler = Handler(Looper.getMainLooper())
+
+    private val allItems = listOf(
+        BreakfastItem("croissant", "Savoury croissant", "Ham", "86.5", true),
+        BreakfastItem("porridge", "Porridge", "Porridge", "82.0", true),
+        BreakfastItem("macaroni", "Macaroni Cheese", "Macaroni Cheese", "84.5", true),
+        BreakfastItem("hotwrap", "Hot wrap", "Hot wrap", "83.0", true),
+        BreakfastItem("soup", "Soup", "Soup", "85.0", false),
+        BreakfastItem("beans", "Breakfast beans", "Breakfast beans", "84.0", false),
+        BreakfastItem("sausage", "Sausage", "Sausage", "83.5", false)
+    )
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        showFloatingButton()
+    }
+
+    private fun showFloatingButton() {
+        if (floatingView != null) return
+        windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+
+        val btn = Button(this).apply {
+            text = "DOLDUR"
+            setBackgroundColor(Color.parseColor("#1976D2"))
+            setTextColor(Color.WHITE)
+            setPadding(28, 16, 28, 16)
+        }
+
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.END or Gravity.CENTER_VERTICAL
+            x = 16
+            y = 0
+        }
+
+        var initialY = 0
+        var initialTouchY = 0f
+        var moved = false
+
+        btn.setOnTouchListener { _, event ->
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    initialY = params.y
+                    initialTouchY = event.rawY
+                    moved = false
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val dy = (event.rawY - initialTouchY).toInt()
+                    if (kotlin.math.abs(dy) > 10) moved = true
+                    params.y = initialY + dy
+                    windowManager?.updateViewLayout(btn, params)
+                    true
+                }
+                MotionEvent.ACTION_UP -> {
+                    if (!moved) runAutoFill()
+                    true
+                }
+                else -> false
+            }
+        }
+
+        floatingView = btn
+        windowManager?.addView(btn, params)
+    }
+
     private fun runAutoFill() {
         val prefs = getSharedPreferences("yoobic_prefs", Context.MODE_PRIVATE)
         val activeItems = allItems.filter { prefs.getBoolean("en_${it.key}", it.defaultEnabled) }
